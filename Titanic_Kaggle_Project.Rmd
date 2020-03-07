@@ -1,0 +1,689 @@
+---
+title: "Titanic Kaggle Project"
+author: "Morteza Maleki"
+date: "2/24/2020"
+output: html_document
+---
+
+Clearing the Environment and loading up the packages:
+
+```{R}
+rm(list = ls())
+
+library(RCurl,quietly = T)
+library(tidyverse,quietly = T)
+library(ggplot2,quietly = T)
+library(gridExtra,quietly = T)
+library(beanplot,quietly = T)
+library(caret,quietly = T)
+library(stringr,quietly = T)
+library(party, quietly = T)
+library(xgboost, quietly = T)
+library(skimr, quietly = T)
+library(alluvial, quietly = T)
+library(pROC, quietly = T)
+library(ggrepel, quietly = T)
+library(alluvial, quietly = T)
+library(Amelia, quietly = T)
+library(glmnet, quietly = T)
+library(C50, quietly = T)
+library(e1071, quietly = T)
+```
+
+Reading in the data:
+
+```{R}
+readData <- function(path.name, file.name, column.types, missing.types) {
+  gurl <- paste(path.name,file.name,sep="")
+  download.file(gurl,file.name,method="curl",quiet = T)
+  tbl_df(read.csv(file.name,colClasses=column.types,
+                  na.strings=missing.types))
+}
+
+Titanic.path <- "https://raw.githubusercontent.com/rsangole/Titanic/master/"
+train.data.file <- "train.csv"
+test.data.file <- "test.csv"
+missing.types <- c("NA", "")
+train.column.types <- c('integer',   # PassengerId
+                        'factor',    # Survived
+                        'factor',    # Pclass
+                        'character', # Name
+                        'factor',    # Sex
+                        'numeric',   # Age
+                        'integer',   # SibSp
+                        'integer',   # Parch
+                        'character', # Ticket
+                        'numeric',   # Fare
+                        'character', # Cabin
+                        'factor'     # Embarked
+)
+
+test.column.types <- train.column.types[-2]     # # no Survived column in test.csv
+train.raw <- readData(path.name = Titanic.path,
+                      file.name = train.data.file,
+                      column.types = train.column.types,
+                      missing.types = missing.types)
+kaggletest.raw <- readData(path.name = Titanic.path,
+                           file.name = test.data.file,
+                           column.types = test.column.types,
+                           missing.types = missing.types)
+
+prep_data <- function(D) {
+  if (!is.null(D$Survived)) {
+    D$Survived <- factor(D$Survived,
+                         levels = c(1, 0),
+                         labels = c('Survived', 'Dead'))
+  }
+  D$Pclass <- factor(D$Pclass,
+                     levels = c(1, 2, 3),
+                     labels = c('P1', 'P2', 'P3'))
+  D$PassengerId <- NULL
+  D
+}
+
+train.raw <- prep_data(train.raw)
+kaggletest.raw <- prep_data(kaggletest.raw)
+
+set.seed(1071, sample.kind = "Rounding")
+training_rows <- caret::createDataPartition(y = train.raw$Survived, p = 0.7, list = F)
+test.raw <- train.raw %>% filter(!(rownames(.) %in% training_rows))
+train.raw <- train.raw %>% filter(rownames(.) %in% training_rows)
+dim(train.raw)
+
+
+round(prop.table(table(complete.cases(train.raw))),2)
+```
+
+
+Data Preparation:
+
+```{R}
+Amelia::missmap(train.raw, main='Missing Values Analysis using Amelia ordered by % missing', col=c('red', 'gray'),legend = F,rank.order = T)
+library(Amelia)
+
+map_int(train.raw,~sum(is.na(.x)))
+
+round(prop.table(table(train.raw$Survived)),2)
+
+p1 <- ggplot(data=train.raw,aes(x=Age))  + geom_histogram(aes(fill=Survived),bins = 40) + coord_flip()
+p2 <- ggplot(data=train.raw,aes(x=Fare)) + geom_histogram(aes(fill=Survived),bins = 40) + coord_flip()
+grid.arrange(p1,p2,nrow=1)
+
+summary(train.raw$Fare)
+
+get_legend<-function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+p <- lapply(X = c('Pclass','Sex','SibSp','Parch','Embarked'),
+            FUN = function(x) ggplot(data = train.raw)+
+              aes_string(x=x,fill='Survived')+
+              geom_bar(position="dodge")+
+              theme(legend.position="none"))
+legend <- get_legend(ggplot(data = train.raw,aes(x=Pclass,fill=Survived))+geom_bar())
+grid.arrange(p[[1]],p[[2]],p[[3]],p[[4]],p[[5]],
+             legend,layout_matrix = cbind(c(1,2,3),
+                                          c(4,5,3),
+                                          c(6,6,6)),
+             widths=c(3,3,1))
+
+
+
+ggplot(train.raw,aes(y=Age,x=Pclass))+geom_boxplot(aes(fill=Survived))+theme_bw()
+beanplot(Age~Survived*Pclass,side='b',train.raw,col=list('yellow','orange'),
+         border = c('yellow2','darkorange'),ll = 0.05,boxwex = .5,
+         main='Passenger survival by pclass and Age',xlab='Passenger Class',ylab='Age')
+legend('topright', fill = c('yellow','orange'), legend = c("Dead", "Survived"),bty = 'n',cex = .8)
+
+
+
+ggplot(train.raw,aes(y=SibSp,x=Parch))+
+  geom_jitter(aes(color=Survived,shape=Pclass))+
+  theme_bw()+
+  scale_shape(solid=F)+
+  geom_vline(xintercept = 3,color='darkred',lty=2)+
+  geom_hline(yintercept = 3,color='red',lty=2)
+
+
+train.raw %>%
+  mutate(Age_Group = case_when(
+    Age < 18 ~ 'Child',
+    Age >= 18 ~ 'Adult'
+  )) %>% 
+  group_by(Survived, Sex, Pclass, Age_Group) %>%
+  summarise(N = n()) %>% 
+  ungroup %>%
+  na.omit -> alluvial_table
+
+alluvial(alluvial_table[,c(-5)],
+         freq = alluvial_table$N,
+         cex = 0.8,
+         col=ifelse(alluvial_table$Survived == "Survived", "blue", "forestgreen"))
+
+
+summary(train.raw$Embarked)
+
+train.imp <- train.raw
+train.imp$Embarked[is.na(train.imp$Embarked)] <- 'S'
+
+train.imp$title <- str_extract(pattern = '[a-zA-Z]+(?=\\.)',string = train.imp$Name)
+train.imp$title <- as.factor(train.imp$title)
+ggplot(train.imp,aes(x=title,y=Age))+
+  geom_jitter(shape=21,alpha=.6,col='blue')+
+  stat_summary(aes(y = Age,group=1), fun.y=median, colour="red", geom="point",group=1)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position="none")+
+  labs(caption='red points are median values')
+
+
+train.imp$title <- as.character(train.imp$title)
+train.imp$title[train.imp$title %in% c('Capt','Col','Major')] <- 'Officer'
+train.imp$title[train.imp$title %in% c('Don','Dr','Rev','Sir','Jonkheer','Countess','Lady','Dona')] <- 'Royalty'
+train.imp$title[train.imp$title %in% c('Mrs','Mme')] <- 'Mrs'
+train.imp$title[train.imp$title %in% c('Ms','Mlle')] <- 'Miss'
+train.imp$title <- as.factor(train.imp$title)
+ggplot(train.imp,aes(x=title,y=Age))+
+  geom_jitter(color='blue',shape=21,alpha=.7)+
+  stat_summary(aes(y = Age,group=1), fun.y=median, colour="red", geom="point",group=1)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(caption='red points are median values')
+
+
+
+age.predictors <- train.imp %>%
+  dplyr::select(-Survived,-Cabin,-Ticket,-Name) %>%
+  dplyr::filter(complete.cases(.))
+ctrl <- trainControl(method = "repeatedcv",
+                     repeats = 5)
+rpartGrid <- data.frame(maxdepth = seq(2,10,1))
+rpartFit_ageimputation <- train(x=age.predictors[,-3],
+                                y=age.predictors$Age,
+                                method='rpart2',
+                                trControl = ctrl,
+                                tuneGrid = rpartGrid
+)
+rpartFit_ageimputation
+
+
+plot(rpartFit_ageimputation)
+rpart.plot::rpart.plot(rpartFit_ageimputation$finalModel, extra=101, box.palette="GnBu")
+save(rpartFit_ageimputation,file = 'rpartFit_ageimputation')
+
+missing_age <- is.na(train.imp$Age)
+age.predicted <- predict(rpartFit_ageimputation, newdata = train.imp[missing_age,])
+train.imp[missing_age,'Age'] <- age.predicted
+
+train.imp %>% 
+  mutate(Age_Imputed = missing_age) %>% 
+  ggplot(aes(x=title,y=Age))+
+  stat_summary(aes(y = Age,group=1), fun.y=median, colour="red", geom="point",group=1)+
+  geom_jitter(aes(y=Age,col=Age_Imputed,shape=Age_Imputed))+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position="none")+
+  labs(caption='green points are imputed values')
+
+
+
+train.imp$child <- 0
+train.imp$child[train.imp$Age<18] <- 1
+
+
+
+train.imp$Seniors <- ifelse(train.imp$Age>60,1,0)
+
+
+
+train.imp$TotalFam <- train.imp$SibSp + train.imp$Parch + 1
+train.imp$LargeFamily <- ifelse(train.imp$TotalFam>4,1,0)
+train.imp$Name <- NULL
+
+
+train.imp$CabinMissing <- as.numeric(is.na(train.raw$Cabin))
+
+train.imp$CabinCode <- map_chr(train.raw$Cabin,~str_split(string = .x,pattern = '')[[1]][1])
+train.imp$CabinCode[is.na(train.imp$CabinCode)] <- 'U'
+train.imp$CabinCode <- as.factor(train.imp$CabinCode)
+
+train.imp$CabinNum <- as.numeric(map_chr(train.raw$Cabin,~str_split(string = .x,pattern = '[a-zA-Z]')[[1]][2]))
+train.imp$CabinNum <- map_int(train.imp$CabinNum, ~as.integer(str_split(.x,pattern = '',simplify = T)[1][1]))
+train.imp$CabinNum[is.na(train.imp$CabinNum)] <- 0
+
+train.imp$TopDeck <- ifelse(train.imp$CabinCode %in% c('A','B'),1,0)
+train.imp$MidDeck <- ifelse(train.imp$CabinCode %in% c('C','D'),1,0)
+train.imp$LowerDeck <- ifelse(train.imp$TopDeck==0 & train.imp$MidDeck==0 ,1,0)
+
+train.imp$NumberofCabins <- map_int(train.raw$Cabin,~str_split(string = .x,pattern = ' ')[[1]] %>% length)
+train.imp$Cabin <- NULL
+
+
+train.imp$Ticket %>% table() %>% as.numeric() %>% table()
+
+
+train.imp %>% group_by(Pclass) %>% dplyr::select(Ticket,Pclass) %>% sample_n(5)
+
+
+train.imp %<>%
+  mutate(
+    Ticket = str_to_upper(Ticket) %>%
+      str_replace_all(pattern = regex(pattern = '[.\\/]'),replacement = ''),
+    TicketNum = str_extract(Ticket,pattern = regex('([0-9]){3,}')),
+    TicketNumStart = map_int(TicketNum,~as.integer(str_split(.x,pattern = '',simplify = T)[1])),
+    TicketNumLen = map_int(TicketNum,~dim(str_split(.x,pattern = '',simplify = T))[2]),
+    TicketChar = str_extract(Ticket,pattern = regex('^[a-zA-Z/\\.]+'))
+  ) %>%
+  mutate(
+    TicketChar = map_chr(.x=TicketChar,
+                         .f=~str_split(string=.x, pattern = '',simplify = T)[1])
+  ) %>%
+  mutate(
+    TicketChar = ifelse(is.na(TicketChar),'U',TicketChar),
+    TicketNumStart = ifelse(is.na(TicketNumStart),0,TicketNumStart),
+    TicketNumLen = ifelse(is.na(TicketNumLen),0,TicketNumLen),
+  ) %>% 
+  mutate(
+    TicketChar = as.factor(TicketChar),
+    TicketNumStart = factor(TicketNumStart,levels = seq(0,9,1)),
+    TicketNumLen = as.factor(TicketNumLen)
+  )
+train.imp$Ticket <- NULL
+train.imp$TicketNum <- NULL
+table(train.imp$TicketChar,dnn ='TicketChar')
+
+
+table(train.imp$TicketNumLen,dnn='TicketNumLen')
+
+
+table(train.imp$TicketNumStart,dnn='TicketNumStart')
+
+table(train.imp$NumberofCabins)
+
+train.imp %>% glimpse()
+```
+
+Elastinet
+
+```{R}
+trl <- trainControl(method = "repeatedcv",
+                     repeats = 5,
+                     verboseIter = F,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = T
+                     # sampling = 'down'
+)
+glmnetGrid <- expand.grid(.alpha = c(0,.2,.4,.6,.8,1),
+                          .lambda = seq(10^-10,10^-1,0.02))
+glmnetFit <- train(
+  Survived~.,
+  train.imp,
+  trControl=ctrl,
+  method='glmnet',
+  tuneGrid = glmnetGrid
+)
+save(glmnetFit,file = 'glmnetFit')
+
+
+
+
+
+glmnetFit
+
+glmnPlot <- plot(glmnetFit,
+                 plotType = "level",
+                 cuts = 15,
+                 scales = list(x = list(rot = 90, cex = .65)))
+update(glmnPlot,
+       xlab = "Mixing Percentage\nRidge <---------> Lasso",
+       sub = "",
+       main = "Area Under the ROC Curve",
+       ylab = "Amount of Regularization")
+densityplot(glmnetFit,pch='|')
+plot(varImp(glmnetFit),15,main='Elastinet Model')
+predict(glmnetFit,type = 'prob') -> train.glmnet.Probs
+histogram(~Survived+Dead,train.glmnet.Probs)
+```
+
+KNN model
+
+```{R}
+
+ctrl <- trainControl(method = "repeatedcv",
+                     repeats = 5,
+                     verboseIter = F,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = T
+                     # sampling = 'down'
+)
+knnGrid <- expand.grid(k=seq(3,23,2))
+knnFit <- train(
+  Survived~.,
+  train.imp,
+  method = 'knn',
+  trControl = ctrl,
+  tuneGrid = knnGrid
+)
+
+save(knnFit,file = 'knnFit')
+
+knnFit
+
+plot(knnFit)
+densityplot(knnFit,pch='|')
+predict(knnFit,type = 'prob') -> train.Probs
+histogram(~Survived+Dead,train.Probs)
+```
+
+SVM Model:
+
+```{R}
+ctrl <- trainControl(method = "repeatedcv",
+                     repeats = 5,
+                     verboseIter = F,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = T
+                     # sampling = 'down'
+)
+svmFit <- train(
+  Survived~.,
+  train.imp,
+  method = 'svmRadial',
+  trControl = ctrl,
+  tuneGrid = expand.grid(C=c(0.05,0.1,0.2,0.3), sigma=c(0.001,0.005,0.01,0.015))
+)
+save(svmFit,file = 'svmFit')
+
+
+
+svmFit
+plot(svmFit)
+densityplot(svmFit,pch='|')
+predict(svmFit,type = 'prob') -> train.Probs
+histogram(~Survived+Dead,train.Probs)
+```
+
+C5.0
+
+```{R}
+
+ctrl <- trainControl(method = "repeatedcv",
+                     repeats = 5,
+                     verboseIter = F,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = T
+)
+c5Fit <- train(
+  Survived~.,
+  train.imp,
+  method = 'C5.0',
+  trControl = ctrl,
+  control = C50::C5.0Control(earlyStopping = FALSE)
+)
+
+
+
+save(c5Fit,file = 'c5Fit')
+
+
+c5Fit
+plot(c5Fit)
+densityplot(c5Fit,pch='|')
+predict(c5Fit,type = 'prob') -> train.Probs
+histogram(~Survived+Dead,train.Probs)
+```
+
+Conditional Inference Random Forest
+
+```{R}
+
+ctrl <- trainControl(method = "repeatedcv",
+                     repeats = 5,
+                     verboseIter = F,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = T
+)
+ciRFgrid <- expand.grid(mtry = c(20,25,30,35,40))
+ciRFFit <- train(Survived~.,
+                 train.imp,
+                 method = "cforest", 
+                 trControl = ctrl,
+                 tuneGrid = ciRFgrid
+) 
+
+save(ciRFFit,file = 'ciRFFit')
+
+ciRFFit
+
+plot(ciRFFit)
+densityplot(ciRFFit,pch='|')
+predict(ciRFFit,type = 'prob') -> train.Probs
+histogram(~Survived+Dead,train.Probs)
+```
+
+
+#Compare Models:
+
+```{R}
+re <- resamples(x = list(
+    knn = knnFit,
+    elastinet = glmnetFit,
+    C50 = c5Fit,
+    svm = svmFit,
+    ciRF = ciRFFit
+  ))
+dotplot(re)
+
+bwplot(re)
+
+difValues <- diff(re)
+dotplot(difValues)
+
+test.imp <- test.raw
+
+#Embarked
+test.imp$Embarked[is.na(test.imp$Embarked)]='S'
+
+#Title
+test.raw$title <- str_extract(pattern = '[a-zA-Z]+(?=\\.)',string = test.raw$Name)
+test.imp$title <- as.character(test.raw$title)
+test.imp$title[test.imp$title %in% c('Capt','Col','Major')] <- 'Officer'
+test.imp$title[test.imp$title %in% c('Don','Dr','Rev','Sir','Jonkheer','Countess','Lady','Dona')] <- 'Royalty'
+test.imp$title[test.imp$title %in% c('Mrs','Mme')] <- 'Mrs'
+test.imp$title[test.imp$title %in% c('Ms','Mlle')] <- 'Miss'
+test.imp$title <- factor(test.imp$title,levels = levels(train.imp$title))
+
+#Missing age
+missing.age <- test.imp %>% filter(is.na(Age)) %>% dplyr::select(-Cabin,-Ticket,-Name)
+age.predicted <- predict(rpartFit_ageimputation, newdata = missing.age)
+test.imp$Age[is.na(test.imp$Age)] <- age.predicted
+
+#Child
+test.imp$child <- 0
+test.imp$child[test.imp$Age<18] <- 1
+
+#Young/old
+test.imp$Seniors <- ifelse(test.imp$Age>60,1,0)
+
+#Family Related
+test.imp$TotalFam <- test.imp$SibSp + test.imp$Parch + 1
+test.imp$LargeFamily <- ifelse(test.imp$TotalFam>4,1,0)
+test.imp$Name <- NULL
+
+#Cabin & Deck
+test.imp$CabinMissing <- as.numeric(is.na(test.raw$Cabin))
+test.imp$CabinCode <- map_chr(test.raw$Cabin,~str_split(string = .x,pattern = '')[[1]][1])
+test.imp$CabinCode[is.na(test.imp$CabinCode)] <- 'U'
+test.imp$CabinCode <- factor(test.imp$CabinCode,levels = levels(train.imp$CabinCode))
+test.imp$CabinNum <- as.numeric(map_chr(test.raw$Cabin,~str_split(string = .x,pattern = '[a-zA-Z]')[[1]][2]))
+test.imp$CabinNum <- map_int(test.imp$CabinNum, ~as.integer(str_split(.x,pattern = '',simplify = T)[1][1]))
+test.imp$CabinNum[is.na(test.imp$CabinNum)] <- 0
+
+test.imp$TopDeck <- ifelse(test.imp$CabinCode %in% c('A','B'),1,0)
+test.imp$MidDeck <- ifelse(test.imp$CabinCode %in% c('C','D'),1,0)
+test.imp$LowerDeck <- ifelse(test.imp$TopDeck==0 & test.imp$MidDeck==0 ,1,0)
+
+test.imp$NumberofCabins <- map_int(test.raw$Cabin,~str_split(string = .x,pattern = ' ')[[1]] %>% length)
+test.imp$Cabin <- NULL
+
+# Ticket
+test.imp %<>%
+  mutate(
+    Ticket = str_to_upper(Ticket) %>%
+      str_replace_all(pattern = regex(pattern = '[.\\/]'),replacement = ''),
+    TicketNum = str_extract(Ticket,pattern = regex('([0-9]){3,}')),
+    TicketNumStart = map_int(TicketNum,~as.integer(str_split(.x,pattern = '',simplify = T)[1])),
+    TicketNumLen = map_int(TicketNum,~dim(str_split(.x,pattern = '',simplify = T))[2]),
+    TicketChar = str_extract(Ticket,pattern = regex('^[a-zA-Z/\\.]+'))
+  ) %>%
+  mutate(
+    TicketChar = map_chr(.x=TicketChar,
+                         .f=~str_split(string=.x, pattern = '',simplify = T)[1])
+  ) %>%
+  mutate(
+    TicketChar = ifelse(is.na(TicketChar),'U',TicketChar),
+    TicketNumStart = ifelse(is.na(TicketNumStart),0,TicketNumStart),
+    TicketNumLen = ifelse(is.na(TicketNumLen),0,TicketNumLen),
+  ) %>% 
+  mutate(
+    TicketChar = as.factor(TicketChar),
+    TicketNumStart = factor(TicketNumStart,levels = seq(0,9,1)),
+    TicketNumLen = as.factor(TicketNumLen)
+  )
+test.imp$Ticket <- NULL
+test.imp$TicketNum <- NULL
+
+elastinetPred   <- predict(object = glmnetFit, newdata = test.imp)
+xgbPred         <- predict(object = xgbFit,    newdata = test.imp)
+c5Pred          <- predict(object = c5Fit,     newdata = test.imp)
+knnPred         <- predict(object = knnFit,    newdata = test.imp)
+svmPred         <- predict(object = svmFit,    newdata = test.imp)
+avNNPred        <- predict(object = avNnetFit, newdata = test.imp)
+ciRFPred        <- predict(object = ciRFFit,   newdata = test.imp)
+
+xtab <- table(xgbPred,test.imp$Survived)
+xgbCM <- caret::confusionMatrix(xtab)
+
+
+xtab <- table(elastinetPred,test.imp$Survived)
+elastinetCM <- caret::confusionMatrix(xtab)
+
+xtab <- table(c5Pred,test.imp$Survived)
+c5CM <- caret::confusionMatrix(xtab)
+
+xtab <- table(knnPred,test.imp$Survived)
+knnCM <-caret::confusionMatrix(xtab)
+
+xtab <- table(svmPred,test.imp$Survived)
+svmCM <-caret::confusionMatrix(xtab)
+
+xtab <- table(ciRFPred,test.imp$Survived)
+ciRFCM <-caret::confusionMatrix(xtab)
+
+CM_list <- list(elastinetCM, c5CM, knnCM, svmCM, ciRFCM)
+
+compiled_results <- tibble(
+  models = c('elastinet','C5.0','knn','svm', 'ciRF'),
+  accuracy = map_dbl(CM_list,~.x$overall[1]),
+  kappa = map_dbl(CM_list,~.x$overall[2]),
+  sensitivity = map_dbl(CM_list,~.x$byClass[1]),
+  specificity = map_dbl(CM_list,~.x$byClass[2]),
+  F1 = map_dbl(CM_list,~.x$byClass[7])
+)
+compiled_results %>% arrange(accuracy,kappa)
+
+dotplot(reorder(models,accuracy)~accuracy,compiled_results, main = 'Accuracy (Test Set Performance)')
+ggplot(compiled_results, aes(F1, accuracy)) +
+  geom_point(color = 'blue',shape=1) +
+  geom_text_repel(aes(label = models),
+                  box.padding=unit(1,'lines'),
+                  max.iter=1e2,segment.size=.3,
+                  force=1) +
+  theme_bw()+
+  labs(x='F1',y='kappa', title='Kappa vs F1 (Test Set Performance)')
+```
+
+The link to the vidio: 
+
+https://rsangole.netlify.com/project/yet-another-titanic-solve/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
